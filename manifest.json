@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "엔트리-Intydse tyd",
+  "version": "1.0",
+  "description": "엔트리 이야기를 실시간으로 업데이트해 줍니다.",
+  "permissions": ["activeTab"],
+  "host_permissions": ["https://playentry.org/*"],
+  "content_scripts": [
+    {
+    "matches": ["https://playentry.org/community/entrystory/list*"],
+    "js": ["content.js"],
+    "css": ["style.css"],
+    "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["ImgEntryStoryBg.svg"],
+      "matches": ["https://playentry.org/*"]
+    }
+  ],
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}
