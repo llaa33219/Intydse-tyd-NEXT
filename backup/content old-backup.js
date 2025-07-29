@@ -168,7 +168,7 @@
       if (hasUnicode) {
         try {
           // 유니코드 도메인을 Punycode로 변환
-          const url = new URL(`http://${hostname}`);
+          const url = new URL(`https://${hostname}`);
           const asciiHostname = url.hostname;
           
           // 변환된 ASCII 도메인으로 검증
@@ -196,6 +196,14 @@
   let temporaryPostStickerItem = null;
   let temporaryCommentStickerItem = null;
   
+  // 이전 요청 결과 저장용 변수들 (변경 사항 비교용)
+  let previousPostsData = new Map(); // postId -> post data
+  let previousCommentsData = new Map(); // postId -> Map(commentId -> comment data)
+  let lastPostsUpdateTime = 0;
+  let lastCommentsUpdateTime = new Map(); // postId -> timestamp
+  let allKnownPostIds = new Set(); // 지금까지 본 모든 포스트 ID들 (삭제 판단용)
+  let allKnownCommentIds = new Map(); // postId -> Set(commentIds) (삭제 판단용)
+
   // State variables
 
 // --- Added by Enhancer Patch 2025-04-18 ---
@@ -237,6 +245,45 @@ async function ensureTokensReady(maxRetries = 3, retryDelay = 300) {
   let sortParam = urlParams.get('sort') || 'created';
   let termParam = urlParams.get('term') || 'all';
   let queryParam = urlParams.get('query') || '';
+
+  // 현재 설정 정보를 문자열로 생성하는 함수
+  function getCurrentSettingsString() {
+    return `${sortParam}|${termParam}|${queryParam || ''}`;
+  }
+
+  // 게시글이 현재 설정과 일치하는지 확인하는 함수
+  function isPostMatchingCurrentSettings(postElement) {
+    if (!postElement || !postElement.dataset) return false;
+    
+    const postSort = postElement.dataset.postSort || '';
+    const postTerm = postElement.dataset.postTerm || '';
+    const postQuery = postElement.dataset.postQuery || '';
+    
+    return (
+      postSort === sortParam &&
+      postTerm === termParam &&
+      postQuery === (queryParam || '')
+    );
+  }
+
+  // 현재 설정과 다른 게시글들을 제거하는 함수
+  async function removePostsWithDifferentSettings(container) {
+    try {
+      if (!container) return;
+      
+      const allPosts = safeQuerySelectorAll('li[data-post-id]', container);
+      
+      for (const postElement of allPosts) {
+        if (!isPostMatchingCurrentSettings(postElement)) {
+          await safeRemoveElement(postElement);
+        }
+      }
+      
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
 
   // 안전한 DOM 조작을 위한 큐 시스템
   function queueDomOperation(operation) {
@@ -477,7 +524,7 @@ async function ensureTokensReady(maxRetries = 3, retryDelay = 300) {
 
     stickerTabs.forEach((tab, index) => {
       // 이미지 URL 생성
-      let imageUrl = '/img/EmptyImage.svg';
+      let imageUrl = 'https://playentry.org/img/EmptyImage.svg';
       if (tab.image && tab.image.filename) {
         const firstTwo = tab.image.filename.substring(0, 2);
         const secondTwo = tab.image.filename.substring(2, 4);
@@ -901,13 +948,17 @@ tabElements.forEach(tabElement => {
 
   // 안전한 HTML 문자열 생성 (XSS 방지)
   function safeHTML(unsafeText) {
-    if (typeof unsafeText !== 'string') return '';
-    return unsafeText
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#039;');
+    try {
+      if (typeof unsafeText !== 'string') return '';
+      return unsafeText
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    } catch (error) {
+      return '';
+    }
   }
 
   // 텍스트에서 URL을 감지하고 <a> 태그로 변환하는 함수 (강화된 검증)
@@ -969,7 +1020,7 @@ tabElements.forEach(tabElement => {
         }
 
         // 유효한 도메인인 경우 링크 생성
-        const finalUrl = protocol ? cleanUrl : `http://${cleanUrl}`;
+        const finalUrl = protocol ? cleanUrl : `https://${cleanUrl}`;
         
         return `<a target="_blank" href="${finalUrl}" rel="noopener noreferrer">${cleanUrl}</a>`;
         
@@ -1795,7 +1846,7 @@ tabElements.forEach(tabElement => {
         return; // 이벤트 처리 완료
       }
       
-      // "삭제하기" 버튼 클릭 - 모든 가능한 방법으로 감지
+      // "삭제하기" 버튼 클릭 - 댓글과 게시글 구분하여 처리
       if (clickedText === '삭제하기' || 
           (tagName === 'a' && clickedText === '삭제하기') ||
           path.some(el => el.textContent && el.textContent.trim() === '삭제하기')) {
@@ -1803,7 +1854,23 @@ tabElements.forEach(tabElement => {
         e.preventDefault();
         e.stopPropagation(); // 이벤트 전파 중지
         
-        // 상위 요소에서 li 요소 찾기
+        // 1단계: 먼저 댓글인지 확인 (가장 가까운 댓글 li 찾기)
+        let commentItem = null;
+        for (const el of path) {
+          if (el.tagName && el.tagName.toLowerCase() === 'li' && el.dataset.commentId) {
+            commentItem = el;
+            break;
+          }
+        }
+        
+        if (commentItem && commentItem.dataset.commentId) {
+          // 댓글 삭제 처리
+          const commentId = commentItem.dataset.commentId;
+          deleteComment(commentId, commentItem);
+          return; // 이벤트 처리 완료
+        }
+        
+        // 2단계: 댓글이 아니면 게시글 삭제 처리
         let postItem = null;
         for (const el of path) {
           if (el.tagName && el.tagName.toLowerCase() === 'li' && el.dataset.postId) {
@@ -1912,6 +1979,46 @@ tabElements.forEach(tabElement => {
             window.location.href = `https://playentry.org/community/entrystory/${postId}`;
           } else {
           }
+        } else {
+        }
+        return; // 이벤트 처리 완료
+      }
+
+      // "좋아요 목록" 버튼 클릭 - 모든 가능한 방법으로 감지
+      if (clickedText === '좋아요 목록' || 
+          (tagName === 'a' && clickedText === '좋아요 목록') ||
+          e.target.classList.contains('like-list') ||
+          path.some(el => el.textContent && el.textContent.trim() === '좋아요 목록') ||
+          path.some(el => el.classList && el.classList.contains('like-list'))) {
+        
+        e.preventDefault();
+        e.stopPropagation(); // 이벤트 전파 중지
+        
+        // data-post-id 속성에서 postId 가져오기 시도
+        let postId = e.target.getAttribute('data-post-id');
+        
+        if (!postId) {
+          // 상위 요소에서 li 요소 찾기
+          let postItem = null;
+          for (const el of path) {
+            if (el.tagName && el.tagName.toLowerCase() === 'li' && el.dataset.postId) {
+              postItem = el;
+              break;
+            }
+          }
+          
+          if (!postItem) {
+            // 대체 방법: 직접 부모 요소 탐색
+            postItem = findClosestPostItem(e.target);
+          }
+          
+          if (postItem) {
+            postId = postItem.dataset.postId;
+          }
+        }
+        
+        if (postId) {
+          showLikeListModal(postId);
         } else {
         }
         return; // 이벤트 처리 완료
@@ -2755,74 +2862,112 @@ tabElements.forEach(tabElement => {
     }
   }
 
-  // 게시글 내용 업데이트
+  // 게시글 내용 업데이트 - 개별 요소만 정확히 업데이트
   async function updatePostContent(element, post) {
     try {
       if (!element || !document.contains(element)) return;
       
+      // 이전 데이터 가져오기
+      const postId = element.dataset.postId;
+      const previousPost = previousPostsData.get(postId);
       
-      // 내용 업데이트 - 링크 활성화 보장
+      // 현재 포커스된 요소가 이 게시글 내부에 있는지 확인
+      const focusedElement = document.activeElement;
+      const isElementFocused = focusedElement && element.contains(focusedElement);
+      
+      // 내용 업데이트 - iframe이 있거나 포커스된 경우 건드리지 않음
       const contentElement = findPostContent(element);
-      if (contentElement) {
-        const currentContent = contentElement.textContent || '';
-        const postContent = post.content || '';
+      if (contentElement && previousPost && previousPost.content !== post.content && !isElementFocused) {
+        // iframe이나 기타 특수 요소가 있는지 확인
+        const hasIframe = contentElement.querySelector('iframe');
+        const hasScript = contentElement.querySelector('script');
+        const hasObject = contentElement.querySelector('object, embed');
         
-        // 내용이 다른 경우에만 업데이트
-        if (currentContent !== postContent) {
-          const newHTML = safeHTMLWithLinks(postContent);
+        if (!hasIframe && !hasScript && !hasObject) {
+          // 안전한 경우에만 내용 업데이트
+          const newHTML = safeHTMLWithLinks(post.content || '');
           await safeSetInnerHTML(contentElement, newHTML);
         }
       }
       
-      // 좋아요 수와 상태 업데이트
+      // 좋아요 수 업데이트 - 개별 요소만 정확히 변경
       const likesElement = safeQuerySelector('.like', element);
-      if (likesElement) {
-        const currentLikes = parseInt(likesElement.textContent.match(/\d+/)[0] || '0');
-        const currentLikedState = likesElement.dataset.liked === 'true';
-        
-        // 좋아요 수 업데이트
-        if (currentLikes !== post.likesLength) {
-          await safeSetTextContent(likesElement, `좋아요 ${post.likesLength}`);
-        }
-        
-        // 좋아요 상태 업데이트
-        if (currentLikedState !== post.isLike) {
-          await queueDomOperation(async () => {
-            likesElement.dataset.liked = post.isLike ? 'true' : 'false';
-            if (post.isLike) {
-              likesElement.classList.add('active');
-            } else {
-              likesElement.classList.remove('active');
-            }
-            return true;
-          });
-        }
+      if (likesElement && previousPost && previousPost.likesLength !== post.likesLength) {
+        await safeSetTextContent(likesElement, `좋아요 ${post.likesLength}`);
       }
       
-      // 댓글 수 업데이트
+      // 좋아요 상태 업데이트 - 클래스와 데이터셋만 변경
+      if (likesElement && previousPost && previousPost.isLike !== post.isLike) {
+        await queueDomOperation(async () => {
+          likesElement.dataset.liked = post.isLike ? 'true' : 'false';
+          if (post.isLike) {
+            likesElement.classList.add('active');
+          } else {
+            likesElement.classList.remove('active');
+          }
+          return true;
+        });
+      }
+      
+      // 댓글 수 업데이트 - 개별 요소만 정확히 변경
       const replyElement = safeQuerySelector('.reply', element);
-      if (replyElement) {
-        const currentComments = parseInt(replyElement.textContent.match(/\d+/)[0] || '0');
-        if (currentComments !== post.commentsLength) {
-          await safeSetTextContent(replyElement, `댓글 ${post.commentsLength}`);
+      if (replyElement && previousPost && previousPost.commentsLength !== post.commentsLength) {
+        // 댓글 수가 음수가 되는 것을 방지
+        const validCommentsLength = Math.max(0, post.commentsLength);
+        await safeSetTextContent(replyElement, `댓글 ${validCommentsLength}`);
+        
+        // 댓글 수가 변경되고 댓글이 열려있는 경우 댓글 새로고침
+        if (postId in activeCommentThreads) {
+          const commentsSection = safeQuerySelector('.css-4e8bhg', element);
+          if (commentsSection) {
+            // 댓글이 열려있으므로 새로고침
+            try {
+              // 댓글 수가 0이 된 경우 특별 처리
+              if (validCommentsLength === 0) {
+                // 댓글이 모두 삭제된 경우 활성 스레드 정리
+                activeCommentThreads[postId].comments = [];
+                activeCommentThreads[postId].lastCommentsCount = 0;
+                activeCommentThreads[postId].total = 0;
+                
+                // UI에서 모든 댓글 제거
+                const commentsList = safeQuerySelector('.css-1e7cskh', commentsSection);
+                if (commentsList) {
+                  await safeSetInnerHTML(commentsList, '');
+                }
+                
+                // "더 보기" 버튼도 제거
+                const commentsContainer = safeQuerySelector('.css-ahy3yn', commentsSection);
+                if (commentsContainer) {
+                  const existingMoreButton = safeQuerySelector('.replay_inner', commentsContainer);
+                  if (existingMoreButton) {
+                    await safeRemoveElement(existingMoreButton);
+                  }
+                }
+              } else {
+                // 댓글이 있는 경우 정상적으로 새로고침
+                await fetchComments(postId, element);
+              }
+            } catch (commentRefreshError) {
+              // 댓글 새로고침 실패 시 조용히 처리
+            }
+          }
         }
       }
       
-      // 스티커 업데이트
-      const existingSticker = safeQuerySelector('.css-18ro4ma', element);
-      
-      if (post.sticker) {
-        // 스티커 URL 생성
-        let stickerUrl = '';
-        if (post.sticker.filename) {
+      // 스티커 업데이트 - 스티커만 정확히 변경 (iframe 등이 있어도 안전)
+      if (previousPost && JSON.stringify(previousPost.sticker) !== JSON.stringify(post.sticker) && !isElementFocused) {
+        const existingSticker = safeQuerySelector('.css-18ro4ma', element);
+        
+        if (post.sticker && post.sticker.filename) {
+          // 스티커 URL 생성
           const firstTwo = post.sticker.filename.substring(0, 2);
           const secondTwo = post.sticker.filename.substring(2, 4);
           const filename = post.sticker.filename;
           const extension = post.sticker.imageType ? `.${post.sticker.imageType.toLowerCase()}` : '';
-          stickerUrl = `/uploads/${firstTwo}/${secondTwo}/${filename}${extension}`;
+          const stickerUrl = `/uploads/${firstTwo}/${secondTwo}/${filename}${extension}`;
           
           if (existingSticker) {
-            // 기존 스티커 업데이트
+            // 기존 스티커의 이미지 src만 변경
             const imgElement = existingSticker.querySelector('img');
             if (imgElement && imgElement.src !== stickerUrl) {
               await queueDomOperation(async () => {
@@ -2831,127 +2976,279 @@ tabElements.forEach(tabElement => {
               });
             }
           } else {
-            // 새 스티커 추가
+            // 새 스티커 추가 (내용 요소 다음에)
             const stickerContainer = document.createElement('em');
             stickerContainer.className = 'css-18ro4ma e1877mpo0';
             stickerContainer.innerHTML = `<img src="${stickerUrl}" alt="sticker">`;
             
-            if (contentElement) {
-              const contentParent = contentElement.parentElement;
-              if (contentParent) {
-                await safeInsertBefore(contentParent, stickerContainer, contentElement.nextSibling);
-              }
+            if (contentElement && contentElement.parentElement) {
+              await safeInsertBefore(contentElement.parentElement, stickerContainer, contentElement.nextSibling);
             }
           }
+        } else if (existingSticker) {
+          // 스티커 제거
+          await safeRemoveElement(existingSticker);
         }
-      } else if (existingSticker) {
-        // 스티커가 없는데 UI에는 있으면 제거
-        await safeRemoveElement(existingSticker);
       }
     } catch (error) {
     }
   }
 
-  // 게시글 UI 업데이트 - 수정됨: 기존 상태 보존하면서 업데이트 + 스크롤 위치 보존
+  // 뷰포트 앵커 계산 - 현재 뷰포트에서 가장 많이 보이는 게시글을 기준점으로 사용
+  function getCurrentViewportAnchor(container) {
+    try {
+      const viewportHeight = window.innerHeight;
+      const posts = safeQuerySelectorAll('li[data-post-id]', container);
+      
+      let bestAnchor = null;
+      let maxVisibleArea = 0;
+      
+      for (const post of posts) {
+        const rect = post.getBoundingClientRect();
+        
+        // 뷰포트와 겹치는 영역 계산
+        const visibleTop = Math.max(0, rect.top);
+        const visibleBottom = Math.min(viewportHeight, rect.bottom);
+        const visibleHeight = Math.max(0, visibleBottom - visibleTop);
+        
+        // 가장 많이 보이는 게시글을 앵커로 선택
+        if (visibleHeight > maxVisibleArea) {
+          maxVisibleArea = visibleHeight;
+          bestAnchor = {
+            postId: post.dataset.postId,
+            offsetTop: rect.top, // 뷰포트 상단에서의 거리
+            element: post
+          };
+        }
+      }
+      
+      return bestAnchor;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  // 뷰포트 위치 복원 - 앵커 게시글을 기준으로 이전 위치 복원
+  function restoreViewportPosition(anchor, container) {
+    try {
+      if (!anchor || !anchor.postId) return false;
+      
+      // 앵커 게시글 찾기
+      const anchorElement = safeQuerySelector(`li[data-post-id="${anchor.postId}"]`, container);
+      if (!anchorElement) return false;
+      
+      // 현재 앵커 요소의 위치
+      const currentRect = anchorElement.getBoundingClientRect();
+      
+      // 이전 위치와의 차이 계산
+      const offsetDiff = currentRect.top - anchor.offsetTop;
+      
+      // 스크롤 조정 (부드럽게)
+      if (Math.abs(offsetDiff) > 1) { // 1px 이상 차이날 때만 조정
+        const currentScroll = window.pageYOffset || document.documentElement.scrollTop;
+        const newScrollTop = currentScroll + offsetDiff;
+        
+        // 스크롤 범위 체크
+        const maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+        const safeScrollTop = Math.max(0, Math.min(maxScroll, newScrollTop));
+        
+        window.scrollTo({
+          top: safeScrollTop,
+          behavior: 'instant' // 즉시 이동 (부드러운 효과 없음)
+        });
+        
+        return true;
+      }
+      
+      return false;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  // 게시글 UI 업데이트 - 이전 데이터와 비교하여 변경된 것만 업데이트
   async function updatePosts(posts, container) {
     try {
       if (!container) return;
       
+      // 먼저 현재 설정과 다른 게시글들 제거
+      await removePostsWithDifferentSettings(container);
       
-      // 현재 스크롤 위치 저장 (화면 이동 방지)
-      const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
-      const scrollElement = document.scrollingElement || document.documentElement;
+      // 현재 포커스된 요소 확인
+      const focusedElement = document.activeElement;
+      const focusedPostElement = focusedElement ? focusedElement.closest('li[data-post-id]') : null;
+      const focusedPostId = focusedPostElement ? focusedPostElement.dataset.postId : null;
       
-      // 기존 게시글들의 상태 보존을 위한 맵핑
+      // 뷰포트 앵커 저장 (현재 사용자가 보고 있는 기준점)
+      const viewportAnchor = getCurrentViewportAnchor(container);
+      
+      // 새로운 포스트 ID들
+      const newPostIds = new Set(posts.map(post => post.id));
+      
+      // 기존 DOM 요소들 매핑
       const existingPostsMap = new Map();
       const existingElements = safeQuerySelectorAll('li[data-post-id]', container);
       
-      // 기존 게시글들의 현재 상태 저장
       existingElements.forEach(element => {
         const postId = element.dataset.postId;
         if (postId) {
           // 댓글이 열려있는지, 편집 중인지 등의 상태 확인
           const hasComments = element.querySelector('.css-4e8bhg');
           const isEditing = element.querySelector('.css-1t2q9uf');
-          const originalClassName = element.dataset.originalClassName;
+          const isFocused = postId === focusedPostId;
           
           existingPostsMap.set(postId, {
             element: element,
             hasComments: !!hasComments,
             isEditing: !!isEditing,
-            originalClassName: originalClassName,
-            currentClassName: element.className
+            isFocused: isFocused
           });
         }
       });
       
-      // 새로운 게시글 ID 목록
-      const newPostIds = new Set(posts.map(post => post.id));
-      
-      // 1. 기존 게시글 중에서 새 목록에 없는 것들 제거
-      for (const [postId, state] of existingPostsMap.entries()) {
-        if (!newPostIds.has(postId) && !state.element.classList.contains('more-section')) {
-          // more-section이 아니고 새 목록에 없는 게시글 제거
-          await safeRemoveElement(state.element);
-          existingPostsMap.delete(postId);
-        }
-      }
-      
-      // 2. 새 게시글들을 순서대로 처리
-      const processedElements = [];
-      
-      for (const post of posts) {
+      // 1. 새로운 포스트들 처리 및 변경된 포스트들 업데이트
+      for (let i = 0; i < posts.length; i++) {
+        const post = posts[i];
         const existingState = existingPostsMap.get(post.id);
+        const previousPost = previousPostsData.get(post.id);
         
         if (existingState) {
-          // 기존 게시글 업데이트 (상태 보존)
-          if (!existingState.isEditing) {
-            // 편집 중이 아닐 때만 내용 업데이트
+          // 기존 포스트 - 편집중이 아니고 포커스되지 않은 경우에만 내용 업데이트
+          if (!existingState.isEditing && !existingState.isFocused && hasPostChanged(previousPost, post)) {
             await updatePostContent(existingState.element, post);
           }
-          processedElements.push(existingState.element);
+          
+          // 좋아요 목록 버튼이 없는 경우 추가
+          const buttonsContainer = safeQuerySelector('.css-1dcwahm', existingState.element);
+          if (buttonsContainer) {
+            const existingLikeListButton = buttonsContainer.querySelector('.like-list');
+            if (!existingLikeListButton) {
+              const likeListButton = document.createElement('em');
+              likeListButton.innerHTML = `<a role="button" class="like-list" data-post-id="${post.id}">좋아요 목록</a>`;
+              buttonsContainer.appendChild(likeListButton);
+            }
+          }
+          
+          // 댓글 수가 변경된 경우 추가 처리 (편집중이거나 포커스된 경우에도 댓글 수는 업데이트)
+          if (previousPost && previousPost.commentsLength !== post.commentsLength) {
+            // UI의 댓글 수 업데이트
+            const replyElement = safeQuerySelector('.reply', existingState.element);
+            if (replyElement) {
+              const validCommentsLength = Math.max(0, post.commentsLength);
+              await safeSetTextContent(replyElement, `댓글 ${validCommentsLength}`);
+            }
+            
+            // 댓글이 열려있는 경우 댓글 새로고침
+            if (post.id in activeCommentThreads && existingState.hasComments) {
+              try {
+                if (post.commentsLength === 0) {
+                  // 댓글이 모두 삭제된 경우 활성 스레드 정리
+                  activeCommentThreads[post.id].comments = [];
+                  activeCommentThreads[post.id].lastCommentsCount = 0;
+                  activeCommentThreads[post.id].total = 0;
+                  
+                  // UI에서 모든 댓글 제거
+                  const commentsList = safeQuerySelector('.css-1e7cskh', existingState.element);
+                  if (commentsList) {
+                    await safeSetInnerHTML(commentsList, '');
+                  }
+                } else {
+                  // 댓글이 있는 경우 정상적으로 새로고침
+                  await fetchComments(post.id, existingState.element);
+                }
+              } catch (commentRefreshError) {
+                // 댓글 새로고침 실패 시 조용히 처리
+              }
+            }
+          }
+          
+          // 포커스된 요소는 순서 조정하지 않음
+          if (!existingState.isFocused) {
+            // 순서 확인 및 조정
+            const currentPosition = Array.from(container.children).indexOf(existingState.element);
+            if (currentPosition !== i) {
+              // 위치가 다르면 올바른 위치로 이동
+              if (i === 0) {
+                const firstChild = container.firstElementChild;
+                if (firstChild !== existingState.element) {
+                  await safeInsertBefore(container, existingState.element, firstChild);
+                }
+              } else {
+                const targetPosition = Array.from(container.children)[i];
+                if (targetPosition !== existingState.element) {
+                  await safeInsertBefore(container, existingState.element, targetPosition);
+                }
+              }
+            }
+          }
         } else {
-          // 새 게시글 생성
+          // 완전히 새로운 포스트 생성 및 삽입
           const newElement = createPostElement(post);
-          processedElements.push(newElement);
+          
+          if (i === 0) {
+            // 첫 번째 위치에 삽입
+            const firstChild = container.firstElementChild;
+            if (firstChild) {
+              await safeInsertBefore(container, newElement, firstChild);
+            } else {
+              await safeAppendChild(container, newElement);
+            }
+          } else {
+            // 적절한 위치에 삽입
+            const currentElements = Array.from(container.children).filter(el => 
+              el.dataset.postId && (newPostIds.has(el.dataset.postId) || el.classList.contains('more-section'))
+            );
+            
+            if (currentElements[i]) {
+              await safeInsertBefore(container, newElement, currentElements[i]);
+            } else {
+              await safeAppendChild(container, newElement);
+            }
+          }
         }
       }
       
-      // 3. 기존 더보기 섹션 게시글들 보존
-      const moreSectionElements = safeQuerySelectorAll('li.more-section[data-custom-extension="true"]', container);
-      const preservedMorePosts = [];
+      // 2. API 응답에서 사라진 포스트들 처리 (신중하게)
+      // 포커스된 요소는 건드리지 않음
+      for (const [postId, state] of existingPostsMap.entries()) {
+        if (!newPostIds.has(postId) && !state.element.classList.contains('more-section') && !state.isFocused) {
+          // 포커스되지 않은 요소만 more-section으로 이동
+          state.element.classList.add('more-section');
+        }
+      }
       
-      moreSectionElements.forEach(element => {
+      // 3. 이전 데이터 업데이트
+      updatePreviousPostsData(posts);
+      
+      // 4. 존재하는 모든 포스트들에 대해 변경사항 재확인 (포커스된 요소 제외)
+      const allDomPosts = safeQuerySelectorAll('li[data-post-id]', container);
+      for (const element of allDomPosts) {
         const postId = element.dataset.postId;
-        if (postId && !newPostIds.has(postId)) {
-          preservedMorePosts.push(element);
-        }
-      });
-      
-      // 4. 컨테이너 내용 재구성
-      await safeSetInnerHTML(container, '');
-      
-      // 최신 게시글들 추가 (순서 유지)
-      for (const element of processedElements) {
-        if (!element.parentNode) {
-          // 새로 생성된 요소나 제거된 요소만 추가
-          await safeAppendChild(container, element);
-        } else {
-          // 이미 DOM에 있는 요소는 다시 추가
-          await safeAppendChild(container, element);
+        if (postId && allKnownPostIds.has(postId) && postId !== focusedPostId) {
+          // 포커스되지 않은 알려진 포스트인데 현재 API 응답에 없는 경우
+          if (!newPostIds.has(postId)) {
+            const isEditing = element.querySelector('.css-1t2q9uf');
+            const previousPost = previousPostsData.get(postId);
+            
+            // 편집중이 아니고 이전 데이터가 있으면 최신 상태 유지
+            if (!isEditing && previousPost) {
+              // 기존 데이터로 상태 유지 (별도 업데이트 없음)
+            }
+          }
         }
       }
       
-      // 보존된 더보기 게시글들 추가
-      for (const element of preservedMorePosts) {
-        await safeAppendChild(container, element);
+      // 뷰포트 위치 복원 (사용자가 보고 있던 위치 유지)
+      if (viewportAnchor) {
+        // DOM 변경이 완료된 후 위치 복원
+        setTimeout(() => {
+          const restored = restoreViewportPosition(viewportAnchor, container);
+          if (!restored) {
+            // 앵커 복원 실패 시 최소한의 안전장치
+            console.log('뷰포트 앵커 복원 실패, 현재 위치 유지');
+          }
+        }, 10); // 약간의 지연을 두어 DOM 변경이 완전히 반영되도록 함
       }
-      
-      // 스크롤 위치 복원 (화면 이동 방지)
-      setTimeout(() => {
-        scrollElement.scrollTop = scrollTop;
-        window.scrollTo(0, scrollTop);
-      }, 0);
       
     } catch (error) {
     }
@@ -2965,12 +3262,17 @@ tabElements.forEach(tabElement => {
       li.className = post.user.id === userId ? 'css-1kivsx6 eelonj20' : 'css-1mswyjj eelonj20';
       li.dataset.customExtension = 'true'; // 커스텀 요소로 표시
       
+      // 현재 설정 정보를 data 속성으로 저장 (어떤 설정으로 생성된 글인지 추적)
+      li.dataset.postSort = sortParam;
+      li.dataset.postTerm = termParam;
+      li.dataset.postQuery = queryParam || '';
+      
       // 날짜 포맷
       const createdDate = new Date(post.created);
       const formattedDate = `${createdDate.getFullYear().toString().slice(2)}.${(createdDate.getMonth() + 1).toString().padStart(2, '0')}.${createdDate.getDate().toString().padStart(2, '0')} ・ ${createdDate.getHours().toString().padStart(2, '0')}:${createdDate.getMinutes().toString().padStart(2, '0')}`;
       
       // 프로필 이미지 URL
-      let profileImageUrl = '/img/EmptyImage.svg';
+      let profileImageUrl = 'https://playentry.org/img/DefaultCardUserThmb.svg';
       if (post.user.profileImage && post.user.profileImage.filename) {
         const firstTwo = post.user.profileImage.filename.substring(0, 2);
         const secondTwo = post.user.profileImage.filename.substring(2, 4);
@@ -2987,7 +3289,7 @@ tabElements.forEach(tabElement => {
         const filename = post.user.mark.filename;
         const extension = post.user.mark.imageType ? `.${post.user.mark.imageType.toLowerCase()}` : '';
         const markImageUrl = `/uploads/${firstTwo}/${secondTwo}/${filename}${extension}`;
-        markHtml = `<span class="css-1b1jxqs ee2n3ac2" style="background-image: url(&quot;${markImageUrl}&quot;), url(&quot;/img/EmptyImage.svg&quot;);"><span class="blind">가드 배지</span></span>`;
+        markHtml = `<span class="css-1b1jxqs ee2n3ac2" style="background-image: url(&quot;${markImageUrl}&quot;), url(&quot;https://playentry.org/img/EmptyImage.svg&quot;);"><span class="blind">가드 배지</span></span>`;
       }
       
       // 옵션 메뉴 HTML - 수정됨: 게시글로 이동 버튼 추가
@@ -3019,7 +3321,7 @@ tabElements.forEach(tabElement => {
 
       li.innerHTML = `
         <div class="css-puqjcw e1877mpo2">
-          <a class="css-18bdrlk enx4swp0" href="/profile/${post.user.id}" style="background-image: url(&quot;${profileImageUrl}&quot;), url(&quot;/img/EmptyImage.svg&quot;);">
+          <a class="css-18bdrlk enx4swp0" href="/profile/${post.user.id}" style="background-image: url(&quot;${profileImageUrl}&quot;), url(&quot;https://playentry.org/img/EmptyImage.svg&quot;);">
             <span class="blind">유저 썸네일</span>
           </a>
           <div class="css-1t19ptn ee2n3ac5">
@@ -3031,6 +3333,7 @@ tabElements.forEach(tabElement => {
           <div class="css-1dcwahm e15ke9c50">
             <em><a role="button" class="${likeClass}" data-liked="${post.isLike ? 'true' : 'false'}">좋아요 ${post.likesLength}</a></em>
             <em><a role="button" class="reply">댓글 ${post.commentsLength}</a></em>
+            <em><a role="button" class="like-list" data-post-id="${post.id}">좋아요 목록</a></em>
           </div>
           <div class="css-13q8c66 e12alrlo2">
             <a role="button" class="css-9ktsbr e12alrlo1" style="display: block;">
@@ -3051,6 +3354,12 @@ tabElements.forEach(tabElement => {
       const fallbackLi = document.createElement('li');
       fallbackLi.dataset.postId = post.id;
       fallbackLi.dataset.customExtension = 'true';
+      
+      // fallback 요소에도 설정 정보 저장
+      fallbackLi.dataset.postSort = sortParam;
+      fallbackLi.dataset.postTerm = termParam;
+      fallbackLi.dataset.postQuery = queryParam || '';
+      
       fallbackLi.textContent = '[게시글 표시 오류]';
       return fallbackLi;
     }
@@ -3301,13 +3610,12 @@ tabElements.forEach(tabElement => {
     try {
       if (!container) return;
       
-      // 현재 스크롤 위치 저장 (화면 이동 방지)
-      const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
-      const scrollElement = document.scrollingElement || document.documentElement;
+      // 뷰포트 앵커 저장 (현재 사용자가 보고 있는 기준점)
+      const viewportAnchor = getCurrentViewportAnchor(container);
       
       // 기존 게시글 맵핑하여 중복 방지
       const existingPostsMap = new Map();
-      const existingPostElements = safeQuerySelectorAll('li', container);
+      const existingPostElements = safeQuerySelectorAll('li[data-post-id]', container);
       existingPostElements.forEach(element => {
         try {
           const postId = element.dataset.postId;
@@ -3327,33 +3635,31 @@ tabElements.forEach(tabElement => {
         await safeAppendChild(container, sectionMarker);
       }
       
-      // 새 게시글만 추가 (더보기 섹션으로 표시)
+      // 새 게시글만 추가 (기존 게시글은 절대 건드리지 않음)
       for (const post of posts) {
         try {
           if (!existingPostsMap.has(post.id)) {
+            // 완전히 새로운 게시글만 추가
             const postElement = createPostElement(post);
             postElement.classList.add('more-section');
             await safeAppendChild(container, postElement);
-          } else {
-            // 이미 있는 게시글이면 내용 업데이트
-            const existingElement = existingPostsMap.get(post.id);
-            if (!existingElement.classList.contains('more-section')) {
-              await queueDomOperation(async () => {
-                existingElement.classList.add('more-section');
-                return true;
-              });
-            }
-            await updatePostContent(existingElement, post);
           }
+          // 이미 존재하는 게시글은 완전히 무시 (건드리지 않음)
         } catch (error) {
         }
       }
       
-      // 스크롤 위치 복원 (화면 이동 방지)
-      setTimeout(() => {
-        scrollElement.scrollTop = scrollTop;
-        window.scrollTo(0, scrollTop);
-      }, 0);
+      // 뷰포트 위치 복원 (사용자가 보고 있던 위치 유지)
+      if (viewportAnchor) {
+        // DOM 변경이 완료된 후 위치 복원
+        setTimeout(() => {
+          const restored = restoreViewportPosition(viewportAnchor, container);
+          if (!restored) {
+            // 앵커 복원 실패 시 최소한의 안전장치  
+            console.log('더보기 뷰포트 앵커 복원 실패, 현재 위치 유지');
+          }
+        }, 10); // 약간의 지연을 두어 DOM 변경이 완전히 반영되도록 함
+      }
       
     } catch (error) {
     }
@@ -3413,9 +3719,11 @@ tabElements.forEach(tabElement => {
   // 댓글 표시 - 스크롤 위치 보존
   async function showComments(postItem, postId) {
     try {
-      // 현재 스크롤 위치 저장 (화면 이동 방지)
-      const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
-      const scrollElement = document.scrollingElement || document.documentElement;
+      // 컨테이너 찾기
+      const container = postItem.closest('#custom-entry-posts-list');
+      
+      // 뷰포트 앵커 저장 (현재 사용자가 보고 있는 기준점)
+      const viewportAnchor = getCurrentViewportAnchor(container);
       
       // 게시글 클래스를 댓글 확장 스타일로 변경
       const originalClassName = postItem.className;
@@ -3477,11 +3785,17 @@ tabElements.forEach(tabElement => {
       // 댓글 가져오기
       await fetchComments(postId, postItem);
       
-      // 스크롤 위치 복원 (화면 이동 방지)
-      setTimeout(() => {
-        scrollElement.scrollTop = scrollTop;
-        window.scrollTo(0, scrollTop);
-      }, 0);
+      // 뷰포트 위치 복원 (사용자가 보고 있던 위치 유지)
+      if (viewportAnchor && container) {
+        // DOM 변경이 완료된 후 위치 복원
+        setTimeout(() => {
+          const restored = restoreViewportPosition(viewportAnchor, container);
+          if (!restored) {
+            // 앵커 복원 실패 시 최소한의 안전장치
+            console.log('댓글 표시 뷰포트 앵커 복원 실패, 현재 위치 유지');
+          }
+        }, 10); // 약간의 지연을 두어 DOM 변경이 완전히 반영되도록 함
+      }
     } catch (error) {
     }
   }
@@ -3489,9 +3803,11 @@ tabElements.forEach(tabElement => {
   // 댓글 숨기기 - 스크롤 위치 보존
   async function hideComments(postItem) {
     try {
-      // 현재 스크롤 위치 저장 (화면 이동 방지)
-      const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
-      const scrollElement = document.scrollingElement || document.documentElement;
+      // 컨테이너 찾기
+      const container = postItem.closest('#custom-entry-posts-list');
+      
+      // 뷰포트 앵커 저장 (현재 사용자가 보고 있는 기준점)
+      const viewportAnchor = getCurrentViewportAnchor(container);
       
       const commentsContainer = postItem.children[1];
       const postId = postItem.dataset.postId;
@@ -3515,11 +3831,17 @@ tabElements.forEach(tabElement => {
       } else {
       }
       
-      // 스크롤 위치 복원 (화면 이동 방지)
-      setTimeout(() => {
-        scrollElement.scrollTop = scrollTop;
-        window.scrollTo(0, scrollTop);
-      }, 0);
+      // 뷰포트 위치 복원 (사용자가 보고 있던 위치 유지)
+      if (viewportAnchor && container) {
+        // DOM 변경이 완료된 후 위치 복원
+        setTimeout(() => {
+          const restored = restoreViewportPosition(viewportAnchor, container);
+          if (!restored) {
+            // 앵커 복원 실패 시 최소한의 안전장치
+            console.log('댓글 숨기기 뷰포트 앵커 복원 실패, 현재 위치 유지');
+          }
+        }, 10); // 약간의 지연을 두어 DOM 변경이 완전히 반영되도록 함
+      }
     } catch (error) {
     }
   }
@@ -3743,6 +4065,30 @@ tabElements.forEach(tabElement => {
             
             if (hasCommentsSection) {
               await updateComments(postItem, activeCommentThreads[postId].comments, total > activeCommentThreads[postId].comments.length);
+              
+              // 서버의 실제 댓글 총 개수와 UI의 댓글 수 동기화
+              const replyElement = safeQuerySelector('.reply', postItem);
+              if (replyElement) {
+                const currentDisplayedCount = parseInt(replyElement.textContent.match(/\d+/)[0] || '0');
+                if (currentDisplayedCount !== total) {
+                  await safeSetTextContent(replyElement, `댓글 ${total}`);
+                  
+                  // latestPosts와 visibleMorePosts 배열의 데이터도 동기화
+                  for (let i = 0; i < latestPosts.length; i++) {
+                    if (latestPosts[i].id === postId) {
+                      latestPosts[i].commentsLength = total;
+                      break;
+                    }
+                  }
+                  
+                  for (let i = 0; i < visibleMorePosts.length; i++) {
+                    if (visibleMorePosts[i].id === postId) {
+                      visibleMorePosts[i].commentsLength = total;
+                      break;
+                    }
+                  }
+                }
+              }
             } else {
               // 댓글 섹션이 열려있지 않을 때는 조용히 스킵 (백그라운드 데이터만 저장)
             }
@@ -3762,12 +4108,15 @@ tabElements.forEach(tabElement => {
     }
   }
 
-  // 댓글 UI 업데이트
+  // 댓글 UI 업데이트 - 이전 데이터와 비교하여 변경된 것만 업데이트
   async function updateComments(postItem, comments, hasMore) {
     try {
       if (!postItem || !document.contains(postItem)) {
         return;
       }
+
+      const postId = postItem.dataset.postId;
+      if (!postId) return;
 
       // 댓글 컨테이너 찾기 - 여러 방법 시도
       let commentsDiv = null;
@@ -3794,7 +4143,10 @@ tabElements.forEach(tabElement => {
         return;
       }
       
-      // 기존 댓글 맵핑
+      // 새로운 댓글 ID들
+      const newCommentIds = new Set(comments.map(comment => comment.id));
+      
+      // 기존 댓글 매핑 (기존 댓글은 건드리지 않기 위해)
       const existingCommentsMap = new Map();
       const existingCommentElements = safeQuerySelectorAll('li', commentsList);
       existingCommentElements.forEach(element => {
@@ -3807,19 +4159,22 @@ tabElements.forEach(tabElement => {
         }
       });
       
-      // 현재 댓글 ID 추적
-      const currentCommentIds = new Set();
+      // 이전 댓글 데이터 가져오기
+      const previousComments = previousCommentsData.get(postId) || new Map();
       
-      // 댓글 추가 또는 업데이트
+      // 1. 새로운 댓글들 처리 및 변경된 댓글들 업데이트
       for (const comment of comments) {
         try {
-          currentCommentIds.add(comment.id);
+          const existingElement = existingCommentsMap.get(comment.id);
+          const previousComment = previousComments.get(comment.id);
           
-          if (existingCommentsMap.has(comment.id)) {
-            // 기존 댓글 업데이트
-            await updateCommentContent(existingCommentsMap.get(comment.id), comment);
+          if (existingElement) {
+            // 기존 댓글 - 실제로 변경된 경우에만 업데이트
+            if (hasCommentChanged(previousComment, comment)) {
+              await updateCommentContent(existingElement, comment);
+            }
           } else {
-            // 새 댓글 추가
+            // 완전히 새로운 댓글만 추가
             const commentElement = createCommentElement(comment);
             await safeAppendChild(commentsList, commentElement);
           }
@@ -3827,22 +4182,45 @@ tabElements.forEach(tabElement => {
         }
       }
       
-      // 삭제된 댓글 제거
+      // 2. API 응답에서 사라진 댓글들 처리 (신중하게)
+      // 실제로 삭제된 것인지 아니면 페이징으로 인해 안 보이는 것인지 확인
       for (const [commentId, element] of existingCommentsMap.entries()) {
         try {
-          // 현재 요청에서 없는 댓글이더라도 activeCommentThreads에 있으면 유지
-          const postId = postItem.dataset.postId;
-          const commentExists = currentCommentIds.has(commentId) || 
-                               (activeCommentThreads[postId]?.comments?.some(c => c.id === commentId));
-          
-          if (!commentExists) {
-            await safeRemoveElement(element);
+          if (!newCommentIds.has(commentId)) {
+            // 현재 요청에 없는 댓글
+            // 실제 삭제 여부를 신중하게 판단해야 함
+            // 일단은 유지하고, 명확한 삭제 시그널이 있을 때만 제거
+            
+            // 알려진 댓글 ID에서 확인
+            const knownCommentIds = allKnownCommentIds.get(postId);
+            if (knownCommentIds && knownCommentIds.has(commentId)) {
+              // 알려진 댓글이므로 유지 (페이징으로 인해 안 보일 수 있음)
+            } else {
+              // 알려지지 않은 댓글이므로 제거 가능
+              await safeRemoveElement(element);
+            }
           }
         } catch (error) {
         }
       }
       
-      // "더 보기" 버튼 추가
+      // 3. 이전 댓글 데이터 업데이트
+      updatePreviousCommentsData(postId, comments);
+      
+      // 4. 존재하는 모든 댓글들에 대해 변경사항 재확인
+      const allDomComments = safeQuerySelectorAll('li[data-comment-id]', commentsList);
+      for (const element of allDomComments) {
+        const commentId = element.dataset.commentId;
+        if (commentId) {
+          const previousComment = previousComments.get(commentId);
+          if (previousComment && !newCommentIds.has(commentId)) {
+            // 현재 API 응답에 없지만 이전에 있던 댓글
+            // 최신 상태 유지 (별도 업데이트 없음)
+          }
+        }
+      }
+      
+      // "더 보기" 버튼 업데이트
       const commentsContainer = safeQuerySelector('.css-ahy3yn', commentsDiv);
       if (commentsContainer) {
         try {
@@ -3866,64 +4244,69 @@ tabElements.forEach(tabElement => {
     }
   }
   
-  // 댓글 내용 업데이트 - 스티커 업데이트 로직 추가
+  // 댓글 내용 업데이트 - 실제 변경사항이 있을 때만 업데이트
   async function updateCommentContent(element, comment) {
     try {
       if (!element || !document.contains(element)) return;
       
-      // 내용 업데이트 - 링크 활성화 보장
+      // 이전 데이터 가져오기
+      const commentId = element.dataset.commentId;
+      const postId = element.closest('[data-post-id]')?.dataset.postId;
+      const previousCommentsMap = previousCommentsData.get(postId);
+      const previousComment = previousCommentsMap?.get(commentId);
+      
+      // 현재 포커스된 요소가 이 댓글 내부에 있는지 확인
+      const focusedElement = document.activeElement;
+      const isElementFocused = focusedElement && element.contains(focusedElement);
+      
+      // 내용 업데이트 - iframe이 있거나 포커스된 경우 건드리지 않음
       const contentElement = safeQuerySelector('.css-6wq60h', element);
-      if (contentElement) {
-        const currentContent = contentElement.textContent || '';
-        const commentContent = comment.content || '';
+      if (contentElement && previousComment && previousComment.content !== comment.content && !isElementFocused) {
+        // iframe이나 기타 특수 요소가 있는지 확인
+        const hasIframe = contentElement.querySelector('iframe');
+        const hasScript = contentElement.querySelector('script');
+        const hasObject = contentElement.querySelector('object, embed');
         
-        // 내용이 다른 경우에만 업데이트
-        if (currentContent !== commentContent) {
-          const newHTML = safeHTMLWithLinks(commentContent);
+        if (!hasIframe && !hasScript && !hasObject) {
+          // 안전한 경우에만 내용 업데이트
+          const newHTML = safeHTMLWithLinks(comment.content || '');
           await safeSetInnerHTML(contentElement, newHTML);
         }
       }
       
-      // 좋아요 수와 상태 업데이트
+      // 좋아요 수 업데이트 - 개별 요소만 정확히 변경
       const likesElement = safeQuerySelector('.like', element);
-      if (likesElement) {
-        const currentLikes = parseInt(likesElement.textContent.match(/\d+/)[0] || '0');
-        const currentLikedState = likesElement.dataset.liked === 'true';
-        
-        // 좋아요 수 업데이트
-        if (currentLikes !== comment.likesLength) {
-          await safeSetTextContent(likesElement, `좋아요 ${comment.likesLength}`);
-        }
-        
-        // 좋아요 상태 업데이트
-        if (currentLikedState !== comment.isLike) {
-          await queueDomOperation(async () => {
-            likesElement.dataset.liked = comment.isLike ? 'true' : 'false';
-            if (comment.isLike) {
-              likesElement.classList.add('active');
-            } else {
-              likesElement.classList.remove('active');
-            }
-            return true;
-          });
-        }
+      if (likesElement && previousComment && previousComment.likesLength !== comment.likesLength) {
+        await safeSetTextContent(likesElement, `좋아요 ${comment.likesLength}`);
       }
-
-      // 스티커 업데이트 로직 추가
-      const existingSticker = safeQuerySelector('.css-18ro4ma', element);
       
-      if (comment.sticker) {
-        // 스티커 URL 생성
-        let stickerUrl = '';
-        if (comment.sticker.filename) {
+      // 좋아요 상태 업데이트 - 클래스와 데이터셋만 변경
+      if (likesElement && previousComment && previousComment.isLike !== comment.isLike) {
+        await queueDomOperation(async () => {
+          likesElement.dataset.liked = comment.isLike ? 'true' : 'false';
+          if (comment.isLike) {
+            likesElement.classList.add('active');
+          } else {
+            likesElement.classList.remove('active');
+          }
+          return true;
+        });
+      }
+      
+      // 스티커 업데이트 - 스티커만 정확히 변경 (iframe 등이 있어도 안전)
+      if (previousComment && JSON.stringify(previousComment.sticker) !== JSON.stringify(comment.sticker) && !isElementFocused) {
+        const existingSticker = safeQuerySelector('.css-18ro4ma', element);
+        
+        if (comment.sticker && comment.sticker.filename) {
+          // 스티커 URL 생성
           const firstTwo = comment.sticker.filename.substring(0, 2);
           const secondTwo = comment.sticker.filename.substring(2, 4);
           const filename = comment.sticker.filename;
           const extension = comment.sticker.imageType ? `.${comment.sticker.imageType.toLowerCase()}` : '';
-          stickerUrl = `/uploads/${firstTwo}/${secondTwo}/${filename}${extension}`;
+          const stickerUrl = `/uploads/${firstTwo}/${secondTwo}/${filename}${extension}`;
           
           if (existingSticker) {
-            // 기존 스티커 업데이트
+            // 기존 스티커의 이미지 src만 변경
             const imgElement = existingSticker.querySelector('img');
             if (imgElement && imgElement.src !== stickerUrl) {
               await queueDomOperation(async () => {
@@ -3932,22 +4315,19 @@ tabElements.forEach(tabElement => {
               });
             }
           } else {
-            // 새 스티커 추가
+            // 새 스티커 추가 (내용 요소 다음에)
             const stickerContainer = document.createElement('em');
             stickerContainer.className = 'css-18ro4ma e1877mpo0';
             stickerContainer.innerHTML = `<img src="${stickerUrl}" alt="sticker">`;
             
-            if (contentElement) {
-              const contentParent = contentElement.parentElement;
-              if (contentParent) {
-                await safeInsertBefore(contentParent, stickerContainer, contentElement.nextSibling);
-              }
+            if (contentElement && contentElement.parentElement) {
+              await safeInsertBefore(contentElement.parentElement, stickerContainer, contentElement.nextSibling);
             }
           }
+        } else if (existingSticker) {
+          // 스티커 제거
+          await safeRemoveElement(existingSticker);
         }
-      } else if (existingSticker) {
-        // 스티커가 없는데 UI에는 있으면 제거
-        await safeRemoveElement(existingSticker);
       }
     } catch (error) {
     }
@@ -3966,7 +4346,7 @@ tabElements.forEach(tabElement => {
       const formattedDate = `${createdDate.getFullYear().toString().slice(2)}.${(createdDate.getMonth() + 1).toString().padStart(2, '0')}.${createdDate.getDate().toString().padStart(2, '0')} ・ ${createdDate.getHours().toString().padStart(2, '0')}:${createdDate.getMinutes().toString().padStart(2, '0')}`;
       
       // 프로필 이미지 URL
-      let profileImageUrl = '/img/EmptyImage.svg';
+      let profileImageUrl = 'https://playentry.org/img/DefaultCardUserThmb.svg';
       if (comment.user.profileImage && comment.user.profileImage.filename) {
         const firstTwo = comment.user.profileImage.filename.substring(0, 2);
         const secondTwo = comment.user.profileImage.filename.substring(2, 4);
@@ -3983,7 +4363,7 @@ tabElements.forEach(tabElement => {
         const filename = comment.user.mark.filename;
         const extension = comment.user.mark.imageType ? `.${comment.user.mark.imageType.toLowerCase()}` : '';
         const markImageUrl = `/uploads/${firstTwo}/${secondTwo}/${filename}${extension}`;
-        markHtml = `<span class="css-1b1jxqs ee2n3ac2" style="background-image: url(&quot;${markImageUrl}&quot;), url(&quot;/img/EmptyImage.svg&quot;);"><span class="blind">가드 배지</span></span>`;
+        markHtml = `<span class="css-1b1jxqs ee2n3ac2" style="background-image: url(&quot;${markImageUrl}&quot;), url(&quot;https://playentry.org/img/EmptyImage.svg&quot;);"><span class="blind">가드 배지</span></span>`;
       }
       
       // 옵션 메뉴 HTML (사용자 자신의 댓글인지에 따라 다름)
@@ -4015,7 +4395,7 @@ tabElements.forEach(tabElement => {
 
       li.innerHTML = `
         <div class="css-uu8yq6 e3yf6l22" data-custom-extension="true">
-          <a class=" css-16djw2l enx4swp0" href="/profile/${comment.user.id}" style="background-image: url(&quot;${profileImageUrl}&quot;), url(&quot;/img/EmptyImage.svg&quot;);" data-custom-extension="true">
+          <a class=" css-16djw2l enx4swp0" href="/profile/${comment.user.id}" style="background-image: url(&quot;${profileImageUrl}&quot;), url(&quot;https://playentry.org/img/EmptyImage.svg&quot;);" data-custom-extension="true">
             <span class="blind" data-custom-extension="true">유저 썸네일</span>
           </a>
           <div class="css-1t19ptn ee2n3ac5" data-custom-extension="true">
@@ -4273,16 +4653,15 @@ finally {
         }
       });
       
-      // 새 댓글만 추가
+      // 새 댓글만 추가 (기존 댓글은 절대 건드리지 않음)
       for (const comment of comments) {
         try {
           if (!existingCommentsMap.has(comment.id)) {
+            // 완전히 새로운 댓글만 추가
             const commentElement = createCommentElement(comment);
             await safeAppendChild(commentsList, commentElement);
-          } else {
-            // 이미 있는 댓글이면 내용 업데이트
-            await updateCommentContent(existingCommentsMap.get(comment.id), comment);
           }
+          // 이미 존재하는 댓글은 완전히 무시 (내용 업데이트도 하지 않음)
         } catch (error) {
         }
       }
@@ -4588,6 +4967,80 @@ async function showEditForm(postItem, postId, content) {
     }
   }
 
+  // 댓글 삭제 함수
+  async function deleteComment(commentId, commentItem) {
+    try {
+      if (!csrfToken || !xToken) {
+        return;
+      }
+      
+      // 사용자가 제공한 REMOVE_COMMENT API 사용
+      const response = await fetch("https://playentry.org/graphql/REMOVE_COMMENT", {
+        method: "POST",
+        headers: {
+          "accept": "*/*",
+          "accept-language": "en-US,en;q=0.7",
+          "content-type": "application/json",
+          "csrf-token": csrfToken,
+          "priority": "u=1, i",
+          "sec-ch-ua": "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Brave\";v=\"138\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"Linux\"",
+          "sec-fetch-dest": "empty",
+          "sec-fetch-mode": "cors",
+          "sec-fetch-site": "same-origin",
+          "sec-gpc": "1",
+          "x-client-type": "Client",
+          "x-token": xToken
+        },
+        body: JSON.stringify({
+          query: `
+            mutation REMOVE_COMMENT($id:ID){
+                removeComment(id: $id){
+                    id
+                }
+            }
+          `,
+          variables: {
+            id: commentId
+          }
+        }),
+        credentials: "include"
+      });
+      
+      const responseText = await response.text();
+      
+      try {
+        const data = JSON.parse(responseText);
+        
+        if (data && data.data && data.data.removeComment) {
+          // UI에서 댓글 제거
+          await safeRemoveElement(commentItem);
+          
+          // 댓글 수 업데이트 - 해당 게시글의 댓글 수를 1 감소시킴
+          const postItem = commentItem.closest('li[data-post-id]');
+          if (postItem) {
+            const replyElement = safeQuerySelector('.reply', postItem);
+            if (replyElement) {
+              const currentText = replyElement.textContent;
+              const currentCount = parseInt(currentText.match(/\d+/)?.[0] || '0');
+              const newCount = Math.max(0, currentCount - 1);
+              await safeSetTextContent(replyElement, `댓글 ${newCount}`);
+            }
+          }
+        } else if (data && data.errors) {
+          console.log('댓글 삭제 오류:', data.errors);
+        } else {
+          console.log('댓글 삭제 응답이 예상과 다름:', data);
+        }
+      } catch (parseError) {
+        console.log('댓글 삭제 응답 파싱 오류:', parseError);
+      }
+    } catch (error) {
+      console.log('댓글 삭제 중 오류:', error);
+    }
+  }
+
   // 게시글 삭제 - 완전히 개선됨
   async function deletePost(postId, postItem) {
     try {
@@ -4816,11 +5269,26 @@ async function showEditForm(postItem, postId, content) {
             
             // 변경된 경우에만 업데이트
             if (newSortParam !== sortParam || newTermParam !== termParam || newQueryParam !== queryParam) {
-              // 전역 매개변수 업데이트
-              sortParam = newSortParam;
-              termParam = newTermParam;
-              queryParam = newQueryParam;
-              
+              // 기존 게시글 컨테이너가 있으면 설정이 다른 게시글들 제거
+              const existingContainer = safeQuerySelector('#custom-entry-posts-list');
+              if (existingContainer) {
+                removePostsWithDifferentSettings(existingContainer).then(() => {
+                  // 전역 매개변수 업데이트
+                  sortParam = newSortParam;
+                  termParam = newTermParam;
+                  queryParam = newQueryParam;
+                }).catch(error => {
+                  // 오류가 발생해도 매개변수는 업데이트
+                  sortParam = newSortParam;
+                  termParam = newTermParam;
+                  queryParam = newQueryParam;
+                });
+              } else {
+                // 컨테이너가 없으면 바로 매개변수 업데이트
+                sortParam = newSortParam;
+                termParam = newTermParam;
+                queryParam = newQueryParam;
+              }
             }
             
             // DOM 조작 큐 초기화
@@ -5243,4 +5711,301 @@ async function showEditForm(postItem, postId, content) {
       safeInit();
     }
   }
+
+  // 데이터 변경 사항 비교 유틸리티 함수들
+  function hasPostChanged(previousPost, currentPost) {
+    if (!previousPost || !currentPost) return true;
+    
+    // 핵심 속성들 비교
+    return (
+      previousPost.content !== currentPost.content ||
+      previousPost.likesLength !== currentPost.likesLength ||
+      previousPost.isLike !== currentPost.isLike ||
+      previousPost.commentsLength !== currentPost.commentsLength ||
+      JSON.stringify(previousPost.sticker) !== JSON.stringify(currentPost.sticker) ||
+      previousPost.created !== currentPost.created
+    );
+  }
+
+  function hasCommentChanged(previousComment, currentComment) {
+    if (!previousComment || !currentComment) return true;
+    
+    // 핵심 속성들 비교
+    return (
+      previousComment.content !== currentComment.content ||
+      previousComment.likesLength !== currentComment.likesLength ||
+      previousComment.isLike !== currentComment.isLike ||
+      JSON.stringify(previousComment.sticker) !== JSON.stringify(currentComment.sticker) ||
+      previousComment.created !== currentComment.created
+    );
+  }
+
+  function updatePreviousPostsData(posts) {
+    const currentTime = Date.now();
+    lastPostsUpdateTime = currentTime;
+    
+    // 새로운 포스트들 데이터 저장
+    for (const post of posts) {
+      previousPostsData.set(post.id, { ...post });
+      allKnownPostIds.add(post.id);
+    }
+  }
+
+  function updatePreviousCommentsData(postId, comments) {
+    const currentTime = Date.now();
+    lastCommentsUpdateTime.set(postId, currentTime);
+    
+    // 댓글 데이터 저장
+    const commentsMap = new Map();
+    for (const comment of comments) {
+      commentsMap.set(comment.id, { ...comment });
+    }
+    previousCommentsData.set(postId, commentsMap);
+    
+    // 알려진 댓글 ID들 업데이트
+    if (!allKnownCommentIds.has(postId)) {
+      allKnownCommentIds.set(postId, new Set());
+    }
+    for (const comment of comments) {
+      allKnownCommentIds.get(postId).add(comment.id);
+    }
+  }
+
+  // --- 좋아요 목록 기능 ---
+  
+  // 좋아요 목록 가져오기
+  async function fetchLikeList(postId) {
+    try {
+      if (!csrfToken || !xToken) {
+        console.log('Missing tokens:', { csrfToken: !!csrfToken, xToken: !!xToken });
+        return null;
+      }
+
+      console.log('Fetching like list for postId:', postId);
+      console.log('Using tokens:', { csrfToken, xToken });
+
+      const requestBody = {
+        query: `
+    query LIKE_LIST($target: String, $groupId: ID, $pageParam: PageParam){\n        likeList(target: $target, groupId: $groupId, pageParam: $pageParam) {\n            total\n            list {\n                \n    id\n    target\n    targetSubject\n    targetType\n    user {\n        \n    id\n    nickname\n    profileImage {\n        \n    id\n    name\n    label {\n        \n    ko\n    en\n    ja\n    vn\n\n    }\n    filename\n    imageType\n    dimension {\n        \n    width\n    height\n\n    }\n    trimmed {\n        filename\n        width\n        height\n    }\n\n    }\n    status {\n        following\n        follower\n    }\n    description\n    role\n    mark {\n        \n    id\n    name\n    label {\n        \n    ko\n    en\n    ja\n    vn\n\n    }\n    filename\n    imageType\n    dimension {\n        \n    width\n    height\n\n    }\n    trimmed {\n        filename\n        width\n        height\n    }\n \n    }\n\n    }\n\n            }\n        }\n    }\n`,
+        variables: {
+          target: postId,
+          targetSubject: "free",
+          pageParam: {
+            display: 100
+          }
+        }
+      };
+
+      console.log('Request body:', JSON.stringify(requestBody, null, 2));
+
+      const response = await fetchWithRetry("https://playentry.org/graphql/LIKE_LIST", {
+        method: "POST",
+        headers: {
+          "accept": "*/*",
+          "accept-language": "ja,en-US;q=0.9,en;q=0.8,ko;q=0.7",
+          "content-type": "application/json",
+          "csrf-token": csrfToken,
+          "priority": "u=1, i",
+          "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": '"Linux"',
+          "sec-fetch-dest": "empty",
+          "sec-fetch-mode": "cors",
+          "sec-fetch-site": "same-origin",
+          "x-client-type": "Client",
+          "x-token": xToken
+        },
+        referrer: window.location.href,
+        referrerPolicy: "unsafe-url",
+        body: JSON.stringify(requestBody),
+        mode: "cors",
+        credentials: "include"
+      });
+
+      console.log('Response status:', response.status);
+      console.log('Response headers:', response.headers);
+
+      const data = await response.json();
+      console.log('Response data:', data);
+      
+      // 에러가 있는 경우 상세 내용 출력
+      if (data.errors) {
+        console.error('GraphQL Errors:', data.errors);
+        data.errors.forEach((error, index) => {
+          console.error(`Error ${index + 1}:`, error.message);
+          if (error.locations) {
+            console.error('Locations:', error.locations);
+          }
+          if (error.path) {
+            console.error('Path:', error.path);
+          }
+        });
+      }
+      
+      if (data && data.data && data.data.likeList) {
+        return data.data.likeList;
+      } else {
+        console.log('No like list data found in response');
+        return null;
+      }
+    } catch (error) {
+      console.error('Error fetching like list:', error);
+      return null;
+    }
+  }
+
+  // 좋아요 목록 모달 표시
+  async function showLikeListModal(postId) {
+    try {
+      console.log('showLikeListModal called with postId:', postId);
+      
+      // 좋아요 목록 가져오기
+      const likeData = await fetchLikeList(postId);
+      
+      console.log('Fetched like data:', likeData);
+      
+      if (!likeData) {
+        console.log('No like data returned, exiting');
+        return;
+      }
+
+      // 기존 모달이 있다면 제거
+      const existingModal = document.getElementById('entry_global_modal');
+      if (existingModal) {
+        console.log('Removing existing modal');
+        existingModal.remove();
+      }
+
+      // 좋아요 목록 HTML 생성
+      let likeListHTML = '';
+      if (likeData.list && likeData.list.length > 0) {
+        console.log('Generating like list HTML for', likeData.list.length, 'users');
+        likeListHTML = likeData.list.map(like => {
+          // 프로필 이미지 URL 생성
+          let profileImageUrl = 'https://playentry.org/img/DefaultCardUserThmb.svg';
+          if (like.user.profileImage && like.user.profileImage.filename) {
+            const firstTwo = like.user.profileImage.filename.substring(0, 2);
+            const secondTwo = like.user.profileImage.filename.substring(2, 4);
+            const filename = like.user.profileImage.filename;
+            const extension = like.user.profileImage.imageType ? `.${like.user.profileImage.imageType.toLowerCase()}` : '';
+            profileImageUrl = `/uploads/${firstTwo}/${secondTwo}/${filename}${extension}`;
+          }
+
+          return `
+            <li class="css-1fo085z e168xw7x4">
+              <a href="/profile/${like.user.id}">
+                <span class="css-7abnxa e168xw7x3">
+                  <img src="${profileImageUrl}" alt="">
+                </span>
+                <strong class="css-xal00d e168xw7x2">${safeHTML(like.user.nickname)}</strong>
+              </a>
+            </li>
+          `;
+        }).join('');
+      } else {
+        console.log('No likes found, showing empty message');
+        likeListHTML = '<li style="text-align: center; padding: 20px; color: #999;">좋아요가 없습니다.</li>';
+      }
+
+      // 모달 HTML 생성
+      const modalHTML = `
+        <div id="entry_global_modal" class="active">
+          <div class="css-12mkjcm e17epaj41"></div>
+          <div width="386" id="popupStyle" class=" css-d9xsgv e17epaj40">
+            <div class="css-1548ohy e168xw7x8">
+              <div class="css-maiyd8 e168xw7x7">
+                <strong class="css-18rbqj2 e168xw7x6">좋아요 <em>${likeData.total}</em></strong>
+                <div class="css-umwchj e168xw7x5">
+                  <ul>
+                    ${likeListHTML}
+                  </ul>
+                  <em class="css-l9bvqd e168xw7x1">최근 100건까지만 표시됩니다.</em>
+                </div>
+              </div>
+              <a href="/" role="button" class="css-16whppa e168xw7x0">
+                <span class="blind">닫기</span>
+              </a>
+            </div>
+          </div>
+        </div>
+      `;
+
+      console.log('Generated modal HTML');
+      console.log('Modal HTML length:', modalHTML.length);
+
+      // 모달을 body에 추가
+      document.body.insertAdjacentHTML('beforeend', modalHTML);
+      console.log('Modal added to DOM');
+
+      // 모달이 실제로 DOM에 추가되었는지 확인
+      const addedModal = document.getElementById('entry_global_modal');
+      if (addedModal) {
+        console.log('Modal successfully found in DOM');
+        console.log('Modal classes:', addedModal.className);
+        
+        // 강제로 중앙 정렬 확실히 하기
+        const modalContainer = addedModal.querySelector('.css-d9xsgv');
+        if (modalContainer) {
+          modalContainer.style.position = 'fixed';
+          modalContainer.style.left = '50%';
+          modalContainer.style.top = '50%';
+          modalContainer.style.transform = 'translate(-50%, -50%)';
+          modalContainer.style.zIndex = '9999';
+          console.log('Forced centering applied to modal container');
+        }
+        
+        // 배경도 확실히 하기
+        addedModal.style.position = 'fixed';
+        addedModal.style.top = '0';
+        addedModal.style.left = '0';
+        addedModal.style.width = '100%';
+        addedModal.style.height = '100%';
+        addedModal.style.zIndex = '9998';
+        addedModal.style.display = 'block';
+        
+      } else {
+        console.error('Modal not found in DOM after insertion');
+        return;
+      }
+
+      // 닫기 버튼 이벤트 리스너 추가
+      const modal = document.getElementById('entry_global_modal');
+      const closeButton = modal.querySelector('.css-16whppa');
+      const backdrop = modal.querySelector('.css-12mkjcm');
+      
+      console.log('Setting up event listeners');
+      console.log('Close button found:', !!closeButton);
+      console.log('Backdrop found:', !!backdrop);
+      
+      const closeModal = (e) => {
+        e.preventDefault();
+        console.log('Closing modal');
+        modal.remove();
+      };
+
+      if (closeButton) {
+        closeButton.addEventListener('click', closeModal);
+      }
+      if (backdrop) {
+        backdrop.addEventListener('click', closeModal);
+      }
+
+      // ESC 키로 모달 닫기
+      const handleKeyDown = (e) => {
+        if (e.key === 'Escape') {
+          console.log('ESC key pressed, closing modal');
+          modal.remove();
+          document.removeEventListener('keydown', handleKeyDown);
+        }
+      };
+      document.addEventListener('keydown', handleKeyDown);
+
+      console.log('Modal setup complete');
+
+    } catch (error) {
+      console.error('Error in showLikeListModal:', error);
+    }
+  }
+
+  // --- 좋아요 목록 기능 끝 ---
 })();
