@@ -145,10 +145,10 @@
     // TLD는 최소 2자 이상
     if (tld.length < 2) return false;
     
-    // 실제 TLD 리스트에 있는지 확인
+    // 실제 TLD 리스트에 있는지 확인 - 더 엄격한 검증
     if (!VALID_TLDS.has(tld)) {
-      // Punycode TLD 확인
-      if (!tld.startsWith('xn--')) return false;
+      // Punycode TLD도 VALID_TLDS에 포함되어야 함 - xn-- 접두사만으로는 허용하지 않음
+      return false;
     }
     
     return true;
@@ -1207,6 +1207,11 @@ tabElements.forEach(tabElement => {
       
       // 토큰 추출 시도
       if (extractTokens()) {
+        // TLD 리스트 즉시 업데이트 (URL 링크 검증을 위해)
+        updateTLDList().catch(error => {
+          // TLD 업데이트 실패해도 계속 진행
+        });
+        
         // 토큰 추출 성공시 즉시 컨테이너 찾기 시작
         checkForPostsContainer();
         setupEventListeners();
@@ -2877,14 +2882,19 @@ tabElements.forEach(tabElement => {
       
       // 내용 업데이트 - iframe이 있거나 포커스된 경우 건드리지 않음
       const contentElement = findPostContent(element);
-      if (contentElement && previousPost && previousPost.content !== post.content && !isElementFocused) {
+      const shouldUpdateContent = contentElement && (
+        !previousPost || // 새 게시글인 경우 항상 처리
+        previousPost.content !== post.content // 또는 내용이 변경된 경우
+      ) && !isElementFocused; // 포커스되지 않은 경우에만
+      
+      if (shouldUpdateContent) {
         // iframe이나 기타 특수 요소가 있는지 확인
         const hasIframe = contentElement.querySelector('iframe');
         const hasScript = contentElement.querySelector('script');
         const hasObject = contentElement.querySelector('object, embed');
         
         if (!hasIframe && !hasScript && !hasObject) {
-          // 안전한 경우에만 내용 업데이트
+          // 안전한 경우에만 내용 업데이트 - URL 링크 처리 포함
           const newHTML = safeHTMLWithLinks(post.content || '');
           await safeSetInnerHTML(contentElement, newHTML);
         }
@@ -4261,14 +4271,19 @@ tabElements.forEach(tabElement => {
       
       // 내용 업데이트 - iframe이 있거나 포커스된 경우 건드리지 않음
       const contentElement = safeQuerySelector('.css-6wq60h', element);
-      if (contentElement && previousComment && previousComment.content !== comment.content && !isElementFocused) {
+      const shouldUpdateContent = contentElement && (
+        !previousComment || // 새 댓글인 경우 항상 처리
+        previousComment.content !== comment.content // 또는 내용이 변경된 경우
+      ) && !isElementFocused; // 포커스되지 않은 경우에만
+      
+      if (shouldUpdateContent) {
         // iframe이나 기타 특수 요소가 있는지 확인
         const hasIframe = contentElement.querySelector('iframe');
         const hasScript = contentElement.querySelector('script');
         const hasObject = contentElement.querySelector('object, embed');
         
         if (!hasIframe && !hasScript && !hasObject) {
-          // 안전한 경우에만 내용 업데이트
+          // 안전한 경우에만 내용 업데이트 - URL 링크 처리 포함
           const newHTML = safeHTMLWithLinks(comment.content || '');
           await safeSetInnerHTML(contentElement, newHTML);
         }
