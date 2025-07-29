@@ -3043,6 +3043,16 @@ tabElements.forEach(tabElement => {
     try {
       if (!anchor || !anchor.postId) return false;
       
+      // 현재 스크롤 위치가 페이지 상단 근처인지 확인
+      const currentScroll = window.pageYOffset || document.documentElement.scrollTop;
+      const viewportHeight = window.innerHeight;
+      const topThreshold = Math.min(viewportHeight * 0.3, 300); // 뷰포트 높이의 30% 또는 최대 300px
+      
+      // 페이지 상단 근처에 있으면 스크롤 위치 보존을 건너뜀
+      if (currentScroll <= topThreshold) {
+        return false;
+      }
+      
       // 앵커 게시글 찾기
       const anchorElement = safeQuerySelector(`li[data-post-id="${anchor.postId}"]`, container);
       if (!anchorElement) return false;
